@@ -46,6 +46,8 @@ import subprocess
 import sys
 import time
 
+__version__ = "0.1.0"
+
 CONFIG = "/etc/imac-fan/config"
 STATE_DIR = "/var/lib/imac-fan"
 MODE_FILE = os.path.join(STATE_DIR, "mode")
@@ -451,6 +453,8 @@ def main(argv):
         cmd_cycle(cfg)
     elif cmd in ("-h", "--help", "help"):
         print(__doc__)
+    elif cmd in ("-V", "--version", "version"):
+        print("imac-fan " + __version__)
     else:
         sys.exit("imac-fan: unknown command %r (try --help)" % cmd)
 

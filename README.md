@@ -3,6 +3,10 @@
 Quiet the runaway fan on an Apple iMac running Linux — a "Macs Fan Control"
 replacement, with an optional [Omarchy](https://omarchy.org) bar widget.
 
+> **Status: v0.1.0, early.** Working and in daily use on one machine
+> (`iMac12,2`). Other models should work but are untested — see
+> [Compatibility](#compatibility).
+
 ## The problem
 
 The 2010–2011 iMacs have three fans: `ODD`, `HDD`, `CPU`. When the original
@@ -91,6 +95,12 @@ password. If `wheel` doesn't exist the daemon falls back to world-writable.
 Tested on a mid-2011 27" iMac (`iMac12,2`, Intel HD 3000 + Radeon HD 6970M).
 Should work on any Mac the `applesmc` driver supports; `FAN` and `CURVE` are
 the only model-specific settings. Not for Apple Silicon.
+
+Running it on another model? Please [open an
+issue](https://github.com/mudiam/imac-fan/issues/new) with your Mac model and
+the output of `sensors` and
+`for f in /sys/devices/platform/applesmc.*/fan?_label; do echo "$f $(cat $f)"; done`
+— it helps build a known-good `FAN`/`CURVE` table.
 
 ## Prior art
 
