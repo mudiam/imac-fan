@@ -50,7 +50,9 @@ sudo ~/.config/omarchy/plugins/imac-fan/daemon/install.sh
 
 `omarchy plugin add` clones the repo to `~/.config/omarchy/plugins/imac-fan/`
 and drops the widget on the bar; the second line installs the daemon it talks
-to. The widget shows the fan RPM; **left** cycles quiet/auto/max, **right**
+to.
+
+The widget shows the fan RPM (<img src="docs/widget.png" alt="fan widget" height="18" valign="middle">); **left** cycles quiet/auto/max, **right**
 forces full speed, **middle** sends a status notification. It turns to a
 fan-alert glyph if the fan is pinned near max with no daemon running.
 
