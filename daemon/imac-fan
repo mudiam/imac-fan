@@ -286,7 +286,12 @@ def snapshot(cfg):
     fmin = read_int(p["min"]) or 1100
     manual = read_int(p["manual"])
     mode = get_mode(cfg)
-    pinned = rpm is not None and rpm >= fmax - 80 and mode != "max"
+    # "pinned" = the firmware is holding the fan near max on its own (no manual
+    # control asserted) and that isn't what we asked for — i.e. the daemon is
+    # not running. A fan still coasting down from a mode change keeps manual=1,
+    # so it does not trip this.
+    pinned = (rpm is not None and rpm >= fmax - 80
+              and not manual and mode not in ("max", "off"))
     return {
         "label": (read_text(p["label"]) or "fan").strip(),
         "mode": mode,
