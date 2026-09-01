@@ -1,0 +1,38 @@
+[Unit]
+Description=iMac fan control (applesmc)
+Documentation=file:/usr/local/bin/imac-fan
+ConditionPathExistsGlob=/sys/devices/platform/applesmc.*
+After=multi-user.target
+
+[Service]
+Type=simple
+StateDirectory=imac-fan
+ExecStartPre=/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/imac-fan.conf
+ExecStart=/usr/local/bin/imac-fan daemon
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Nice=-5
+
+# Hardening — the daemon only needs to read a couple of files and write
+# /sys/.../applesmc.*/fan* plus the mode file under /var/lib/imac-fan.
+# ProtectSystem=strict keeps /usr and /etc read-only but leaves /sys writable
+# (do NOT add ProtectKernelTunables — that would remount /sys read-only).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/imac-fan
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

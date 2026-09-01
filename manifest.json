@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "imac-fan",
+  "name": "iMac fan",
+  "version": "1.0.0",
+  "author": "mudiam",
+  "description": "HDD-fan RPM and mode for Apple iMacs (applesmc), backed by the imac-fan daemon",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "iMac fan",
+    "description": "HDD fan RPM + mode; left cycles quiet/auto/max, right forces full, middle notifies",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""imac-fan - control the applesmc "HDD" fan on an Apple iMac under Linux.
+
+Background
+----------
+On 2011 iMacs whose original Apple hard drive was replaced with a third-party
+SSD/HDD, the SMC loses the drive temperature signal and pins that fan at its
+maximum RPM forever. macOS users fix this with "Macs Fan Control". This is the
+Linux equivalent: a small root daemon that holds the fan on a quiet
+temperature-based curve, plus a CLI (and an Omarchy bar widget) to switch modes.
+
+Only the one fan named in the config (default fan2 = "HDD") is touched. The CPU
+and optical-drive fans stay under the firmware's own control.
+
+Subcommands
+-----------
+  daemon            run the control loop (used by the systemd service)
+  status            human-readable state
+  json              machine-readable state (one line, for the bar widget)
+  notify            desktop notification with current state
+  quiet             hold the fan at QUIET_RPM
+  auto              follow the temperature curve (default)
+  max               hold the fan at its maximum
+  off               release the fan back to firmware control (it will get loud)
+  set <rpm>         hold the fan at a fixed RPM
+  cycle             quiet -> auto -> max -> quiet  (what the widget calls)
+  get-mode          print the current mode string
+
+Mode is stored in /var/lib/imac-fan/mode (root:wheel, group-writable; one
+keyword). The CLI and the bar widget change it without root; only the daemon
+writes to sysfs. The daemon sanitises whatever it reads back from that file, so
+a bogus value can never do more than fall through to the 'auto' curve.
+
+If the 'wheel' group is missing the daemon leaves the file world-writable
+instead, so mode switching still works.
+"""
+
+from __future__ import annotations
+
+import glob
+import grp
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG = "/etc/imac-fan/config"
+STATE_DIR = "/var/lib/imac-fan"
+MODE_FILE = os.path.join(STATE_DIR, "mode")
+VALID_MODES = ("quiet", "auto", "max", "off")
+
+FAN_GLYPH = "\U000F0210"        # nf-md-fan
+ALERT_GLYPH = "\U000F146C"      # nf-md-fan_alert
+
+DEFAULTS = {
+    "FAN": "2",
+    "QUIET_RPM": "1100",
+    # "temp:rpm" points, ascending temp; linear interpolation between them.
+    "CURVE": "55:1100 68:1900 78:3200 85:4800",
+    "INTERVAL": "5",
+    "RESTORE_ON_EXIT": "1",
+    "CRITICAL_TEMP": "92",
+    "DEFAULT_MODE": "auto",
+}
+
+
+# --------------------------------------------------------------------------- io
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def read_int(path):
+    v = read_text(path)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def write_sysfs(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+        return True
+    except OSError as e:
+        print("imac-fan: cannot write %s: %s" % (path, e), file=sys.stderr)
+        return False
+
+
+def smc_dir():
+    for d in sorted(glob.glob("/sys/devices/platform/applesmc.*")):
+        return d
+    sys.exit("imac-fan: applesmc device not found - is the 'applesmc' module loaded?")
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return cfg
+
+
+# ------------------------------------------------------------------------ model
+
+def fan_paths(cfg):
+    d = smc_dir()
+    n = cfg["FAN"]
+    return {k: "%s/fan%s_%s" % (d, n, k) for k in
+            ("input", "manual", "output", "min", "max", "label")}
+
+
+def all_temps():
+    """Map of sensor label -> degrees C (applesmc keys + CPU package)."""
+    out = {}
+    d = smc_dir()
+    for lp in glob.glob("%s/temp*_label" % d):
+        lab = read_text(lp)
+        val = read_int(lp.replace("_label", "_input"))
+        if lab and val is not None and val > 0:
+            out[lab] = val / 1000.0
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read_text("%s/name" % hw) == "coretemp":
+            v = read_int("%s/temp1_input" % hw)
+            if v is not None:
+                out["CPU package"] = v / 1000.0
+    return out
+
+
+def regulating_temp(temps):
+    """(source, degrees) we regulate against: hotter of CPU and GPU."""
+    picks = []
+    for key, name in (("CPU package", "CPU"), ("TC0P", "CPU"), ("TC0H", "CPU")):
+        if key in temps:
+            picks.append((name, temps[key]))
+            break
+    for key in ("TG0D", "TG0H", "TG0P"):
+        if key in temps:
+            picks.append(("GPU", temps[key]))
+            break
+    if not picks:
+        return ("?", 0.0)
+    return max(picks, key=lambda p: p[1])
+
+
+def parse_curve(spec):
+    pts = []
+    for tok in spec.split():
+        try:
+            t, r = tok.split(":")
+            pts.append((float(t), float(r)))
+        except ValueError:
+            continue
+    pts.sort()
+    return pts or [(55.0, 1100.0), (85.0, 4800.0)]
+
+
+def curve_rpm(curve, temp):
+    if temp <= curve[0][0]:
+        return curve[0][1]
+    if temp >= curve[-1][0]:
+        return curve[-1][1]
+    for (t0, r0), (t1, r1) in zip(curve, curve[1:]):
+        if t0 <= temp <= t1:
+            frac = (temp - t0) / (t1 - t0) if t1 != t0 else 0.0
+            return r0 + frac * (r1 - r0)
+    return curve[-1][1]
+
+
+def target_rpm(cfg, mode, fmin, fmax, temp):
+    """Desired RPM for the current mode, or None to release firmware control."""
+    if mode == "off":
+        return None
+    if mode == "max":
+        return fmax
+    if mode == "quiet":
+        base = float(cfg["QUIET_RPM"])
+    elif mode.startswith("fixed:"):
+        try:
+            base = float(mode.split(":", 1)[1])
+        except ValueError:
+            base = float(cfg["QUIET_RPM"])
+    else:  # auto / anything unknown
+        base = curve_rpm(parse_curve(cfg["CURVE"]), temp)
+    if temp >= float(cfg["CRITICAL_TEMP"]):
+        base = fmax
+    return int(round(max(fmin, min(fmax, base))))
+
+
+# ------------------------------------------------------------------------- mode
+
+def sanitize_mode(raw):
+    """Reduce arbitrary file content to a known-good mode string.
+
+    Accepts quiet|auto|max|off and fixed:<int>; anything else becomes 'auto'.
+    This is the only place file content is trusted, so it stays strict.
+    """
+    tok = (raw or "").strip().split()
+    m = tok[0].lower() if tok else ""
+    if m in VALID_MODES:
+        return m
+    if m.startswith("fixed:"):
+        try:
+            rpm = int(m.split(":", 1)[1])
+        except ValueError:
+            return "auto"
+        return "fixed:%d" % rpm if 0 < rpm <= 20000 else "auto"
+    return "auto"
+
+
+def get_mode(cfg=None):
+    raw = read_text(MODE_FILE)
+    if not raw:
+        return sanitize_mode((cfg or load_config())["DEFAULT_MODE"])
+    return sanitize_mode(raw)
+
+
+def _wheel_gid():
+    try:
+        return grp.getgrnam("wheel").gr_gid
+    except KeyError:
+        return None
+
+
+def ensure_state():
+    """Create the mode file and set its permissions (root daemon only).
+
+    Preferred: root:wheel, group-writable (0664 file / 0775 dir) so only
+    members of 'wheel' can switch modes. Fallback if 'wheel' does not exist:
+    world-writable, so mode switching still works on a single-user box.
+    """
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+    except OSError:
+        pass
+    gid = _wheel_gid()
+    try:
+        if not os.path.exists(MODE_FILE):
+            with open(MODE_FILE, "w") as f:
+                f.write(get_mode() + "\n")
+        if gid is not None:
+            os.chown(STATE_DIR, 0, gid)
+            os.chmod(STATE_DIR, 0o775)
+            os.chown(MODE_FILE, 0, gid)
+            os.chmod(MODE_FILE, 0o664)
+        else:
+            os.chmod(STATE_DIR, 0o777)
+            os.chmod(MODE_FILE, 0o666)
+    except OSError:
+        pass
+
+
+def set_mode(m):
+    try:
+        with open(MODE_FILE, "w") as f:
+            f.write(m + "\n")
+    except OSError as e:
+        sys.exit("imac-fan: cannot write %s (%s). Is imac-fan.service running?"
+                 % (MODE_FILE, e))
+
+
+# --------------------------------------------------------------------- snapshot
+
+def snapshot(cfg):
+    p = fan_paths(cfg)
+    temps = all_temps()
+    src, temp = regulating_temp(temps)
+    rpm = read_int(p["input"])
+    fmax = read_int(p["max"]) or 5500
+    fmin = read_int(p["min"]) or 1100
+    manual = read_int(p["manual"])
+    mode = get_mode(cfg)
+    pinned = rpm is not None and rpm >= fmax - 80 and mode != "max"
+    return {
+        "label": (read_text(p["label"]) or "fan").strip(),
+        "mode": mode,
+        "rpm": rpm,
+        "min": fmin,
+        "max": fmax,
+        "manual": bool(manual),
+        "temp": round(temp, 1),
+        "temp_src": src,
+        "pinned": pinned,
+    }
+
+
+# --------------------------------------------------------------------- commands
+
+def cmd_daemon(cfg):
+    p = fan_paths(cfg)
+    fmin = read_int(p["min"]) or 1100
+    fmax = read_int(p["max"]) or 5500
+    interval = max(1.0, float(cfg["INTERVAL"]))
+    restore = cfg["RESTORE_ON_EXIT"] == "1"
+    ensure_state()
+
+    stopping = {"v": False}
+    wake = {"v": False}
+    signal.signal(signal.SIGTERM, lambda *_: stopping.__setitem__("v", True))
+    signal.signal(signal.SIGINT, lambda *_: stopping.__setitem__("v", True))
+    signal.signal(signal.SIGUSR1, lambda *_: wake.__setitem__("v", True))
+
+    label = (read_text(p["label"]) or ("fan%s" % cfg["FAN"])).strip()
+    print("imac-fan: controlling '%s' (fan%s), range %d-%d RPM, curve %r"
+          % (label, cfg["FAN"], fmin, fmax, cfg["CURVE"]), flush=True)
+
+    last_line = None
+    last_mode = None
+    try:
+        while not stopping["v"]:
+            mode = get_mode(cfg)
+            src, temp = regulating_temp(all_temps())
+            rpm = target_rpm(cfg, mode, fmin, fmax, temp)
+            if rpm is None:
+                write_sysfs(p["manual"], 0)
+                state = "mode=off (%s %.0f degC) -> firmware control" % (src, temp)
+            else:
+                write_sysfs(p["manual"], 1)
+                write_sysfs(p["output"], rpm)
+                state = "mode=%s (%s %.0f degC) -> %d RPM" % (mode, src, temp, rpm)
+            if state != last_line:
+                print("imac-fan:", state, flush=True)
+                last_line = state
+            last_mode = mode
+            # Poll for a mode change (from the CLI / bar widget) between full
+            # ticks so a click on the widget acts within a fraction of a second.
+            slept = 0.0
+            while slept < interval and not stopping["v"]:
+                if wake["v"]:
+                    wake["v"] = False
+                    break
+                if get_mode(cfg) != last_mode:
+                    break
+                time.sleep(0.25)
+                slept += 0.25
+    finally:
+        if restore:
+            write_sysfs(p["manual"], 0)
+            print("imac-fan: released fan to firmware control", flush=True)
+
+
+def _fmt_status(s):
+    rpm = "?" if s["rpm"] is None else ("%d RPM" % s["rpm"])
+    lines = [
+        "%s fan: %s   (%d-%d RPM)" % (s["label"], rpm, s["min"], s["max"]),
+        "mode:        %s%s" % (s["mode"], "   [MANUAL]" if s["manual"] else ""),
+        "regulating:  %.0f degC (%s)" % (s["temp"], s["temp_src"]),
+    ]
+    if s["pinned"]:
+        lines.append("note:        fan is pinned near maximum - daemon not "
+                     "running? try: systemctl status imac-fan")
+    return "\n".join(lines)
+
+
+def cmd_status(cfg):
+    print(_fmt_status(snapshot(cfg)))
+
+
+def cmd_json(cfg):
+    s = snapshot(cfg)
+    glyph = ALERT_GLYPH if s["pinned"] else FAN_GLYPH
+    css = "pinned" if s["pinned"] else s["mode"]
+    rpm = "" if s["rpm"] is None else (" %d" % s["rpm"])
+    tip = _fmt_status(s) + "\n\nleft: cycle mode  -  right: full speed  -  middle: status"
+    print(json.dumps({
+        "text": glyph + rpm,
+        "alt": s["mode"],
+        "tooltip": tip,
+        "class": css,
+        "mode": s["mode"],
+        "rpm": s["rpm"],
+        "temp": s["temp"],
+        "pinned": s["pinned"],
+    }))
+
+
+def cmd_notify(cfg):
+    s = snapshot(cfg)
+    title = "%s fan - %s" % (s["label"], s["mode"])
+    body = _fmt_status(s)
+    for argv in (["omarchy-notification-send", title, body],
+                 ["notify-send", "-a", "imac-fan", title, body]):
+        try:
+            if subprocess.run(argv, check=False, capture_output=True).returncode == 0:
+                return
+        except OSError:
+            continue
+    print(body)
+
+
+def cmd_set_mode(cfg, mode):
+    set_mode(mode)
+    cmd_status(cfg)
+
+
+def cmd_set_fixed(cfg, rpm):
+    try:
+        rpm = int(rpm)
+    except ValueError:
+        sys.exit("imac-fan: set <rpm> - rpm must be an integer")
+    set_mode("fixed:%d" % rpm)
+    cmd_status(cfg)
+
+
+def cmd_cycle(cfg):
+    order = ["quiet", "auto", "max"]
+    cur = get_mode(cfg)
+    try:
+        nxt = order[(order.index(cur) + 1) % len(order)]
+    except ValueError:
+        nxt = "auto"          # was 'off' or 'fixed:*'
+    set_mode(nxt)
+    cmd_status(cfg)
+
+
+def main(argv):
+    cfg = load_config()
+    cmd = argv[0] if argv else "status"
+
+    if cmd == "daemon":
+        cmd_daemon(cfg)
+    elif cmd == "status":
+        cmd_status(cfg)
+    elif cmd == "json":
+        cmd_json(cfg)
+    elif cmd == "notify":
+        cmd_notify(cfg)
+    elif cmd == "get-mode":
+        print(get_mode(cfg))
+    elif cmd in VALID_MODES:
+        cmd_set_mode(cfg, cmd)
+    elif cmd == "set":
+        if len(argv) < 2:
+            sys.exit("usage: imac-fan set <rpm>")
+        cmd_set_fixed(cfg, argv[1])
+    elif cmd == "cycle":
+        cmd_cycle(cfg)
+    elif cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    else:
+        sys.exit("imac-fan: unknown command %r (try --help)" % cmd)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        pass
